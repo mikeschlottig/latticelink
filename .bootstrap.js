@@ -77,7 +77,9 @@ function updateWranglerJsonc() {
 }
 
 function runSetupCommands() {
-    const commands = [];
+    const commands = [
+    "bun add node-fetch@^3.3.2"
+];
     
     if (commands.length === 0) {
         console.log('⊘ No setup commands to run');
