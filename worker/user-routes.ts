@@ -27,8 +27,14 @@ const querySchema = z.object({
     mime: z.string().optional(),
   }).optional(),
 });
-// --- MIDDLEWARE ---
+/* --- MIDDLEWARE --- */
 const jsonRequired = async (c: any, next: any) => {
+  // Allow preflight (OPTIONS) and HEAD requests to pass through without requiring Accept header
+  const method = (c.req.method || '').toUpperCase();
+  if (method === 'OPTIONS' || method === 'HEAD') {
+    await next();
+    return;
+  }
   if (!c.req.header('Accept')?.includes('application/json')) {
     return bad(c, 'Accept header must include application/json');
   }
