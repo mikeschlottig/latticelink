@@ -70,22 +70,25 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
       if (!getRes.ok) return bad(c, `Failed to fetch URL: ${getRes.status}`);
       const html = await getRes.text();
       const { title, description, h1, plainText } = parseHtml(html);
+      if (!c.env.AI) return serverError(c, 'AI binding is not configured.');
       const vector = await embedText(c.env.AI, plainText);
       const linkEntity = new LinkEntity(c.env, link.id);
       const updatedLink = await linkEntity.mutate(s => ({ ...s, title, description, h1, mime, byteSize, lastModified }));
+      if (!c.env.VECTORIZE) return serverError(c, 'VECTORIZE binding is not configured.');
       await upsertVector(c.env.VECTORIZE, updatedLink, vector);
       log(c, { level: 'info', msg: 'Ingest successful', status: 200, latencyMs: Date.now() - start });
       return ok(c, { id: updatedLink.id, existed: false, link: updatedLink });
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (e instanceof z.ZodError) return bad(c, 'Invalid request body', e.issues);
-      log(c, { level: 'error', msg: `Ingest failed: ${e.message}` });
+      const message = e instanceof Error ? e.message : 'Unknown error';
+      log(c, { level: 'error', msg: `Ingest failed: ${message}` });
       return serverError(c, 'Ingestion failed');
     }
   });
   app.get('/api/search', async (c) => {
     const start = Date.now();
     try {
-      const queryParams = Object.fromEntries(new URL(c.req.url).searchParams);
+      const queryParams = c.req.query();
       const { q, tags, mime, limit, offset } = searchSchema.parse(queryParams);
       log(c, { level: 'info', msg: 'Search request' });
       let results: SearchResult[] = [];
@@ -103,7 +106,9 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
           )
           .map(link => ({ ...link, score: null }));
       } else {
+        if (!c.env.AI) return serverError(c, 'AI binding is not configured.');
         const queryVector = await embedText(c.env.AI, q);
+        if (!c.env.VECTORIZE) return serverError(c, 'VECTORIZE binding is not configured.');
         const vectorResults = await searchVectors(c.env.VECTORIZE, queryVector, limit * 2);
         if (vectorResults.length > 0) {
           const linkIds = vectorResults.map(r => r.id);
@@ -115,7 +120,7 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
               const link = linksById.get(vr.id);
               return link ? { ...link, score: vr.score } : null;
             })
-            .filter((r): r is SearchResult => r !== null)
+            .filter((r): r is SearchResult => r !== null && typeof r.score === 'number')
             .filter(r =>
               (searchTags.length === 0 || searchTags.every(t => r.tags.includes(t))) &&
               (!mime || new RegExp('^' + mime.replace(/\*/g, '.*')).test(r.mime))
@@ -125,9 +130,10 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
       const paginatedResults = results.slice(offset, offset + limit);
       log(c, { level: 'info', msg: 'Search successful', status: 200, latencyMs: Date.now() - start });
       return ok(c, paginatedResults);
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (e instanceof z.ZodError) return bad(c, 'Invalid query parameters', e.issues);
-      log(c, { level: 'error', msg: `Search failed: ${e.message}` });
+      const message = e instanceof Error ? e.message : 'Unknown error';
+      log(c, { level: 'error', msg: `Search failed: ${message}` });
       return serverError(c, 'Search failed');
     }
   });
@@ -149,7 +155,9 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
       const body = await c.req.json();
       const { naturalLanguageQuery, filters } = querySchema.parse(body);
       log(c, { level: 'info', msg: 'Agent query' });
+      if (!c.env.AI) return serverError(c, 'AI binding is not configured.');
       const queryVector = await embedText(c.env.AI, naturalLanguageQuery);
+      if (!c.env.VECTORIZE) return serverError(c, 'VECTORIZE binding is not configured.');
       const vectorResults = await searchVectors(c.env.VECTORIZE, queryVector, 20);
       if (vectorResults.length === 0) return ok(c, []);
       const linkIds = vectorResults.map(r => r.id);
@@ -163,16 +171,17 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
           const link = linksById.get(vr.id);
           return link ? { ...link, score: vr.score } : null;
         })
-        .filter((r): r is SearchResult => r !== null)
+        .filter((r): r is SearchResult => r !== null && typeof r.score === 'number')
         .filter(r =>
           (searchTags.length === 0 || searchTags.every(t => r.tags.includes(t))) &&
           (!mime || new RegExp('^' + mime.replace(/\*/g, '.*')).test(r.mime))
         );
       log(c, { level: 'info', msg: 'Agent query successful', status: 200, latencyMs: Date.now() - start });
       return ok(c, results);
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (e instanceof z.ZodError) return bad(c, 'Invalid request body', e.issues);
-      log(c, { level: 'error', msg: `Agent query failed: ${e.message}` });
+      const message = e instanceof Error ? e.message : 'Unknown error';
+      log(c, { level: 'error', msg: `Agent query failed: ${message}` });
       return serverError(c, 'Agent query failed');
     }
   });
@@ -180,7 +189,7 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
     const start = Date.now();
     try {
       const d1Count = (await LinkEntity.list(c.env, null, 10000)).items.length;
-      const vectorizeCount = -1; // Placeholder, not directly available
+      const vectorizeCount = c.env.VECTORIZE ? 'available' : 'unavailable';
       const healthData = {
         version: '1.0.0',
         vectorizeCount,
@@ -190,8 +199,9 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
       };
       log(c, { level: 'info', msg: 'Health check successful', status: 200, latencyMs: Date.now() - start });
       return ok(c, healthData);
-    } catch (e: any) {
-      log(c, { level: 'error', msg: `Health check failed: ${e.message}` });
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : 'Unknown error';
+      log(c, { level: 'error', msg: `Health check failed: ${message}` });
       return serverError(c, 'Health check failed');
     }
   });
