@@ -77,11 +77,7 @@ function updateWranglerJsonc() {
 }
 
 function runSetupCommands() {
-    const commands = [
-    "bun add node-fetch@^3.3.2",
-    "bun install @hono/zod-validator",
-    "bun add @hono/zod-validator"
-];
+    const commands = [];
     
     if (commands.length === 0) {
         console.log('⊘ No setup commands to run');

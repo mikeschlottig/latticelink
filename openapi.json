@@ -1,0 +1,95 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "LatticeLink API",
+    "version": "1.0.0",
+    "description": "API for ingesting, searching, and managing vectorized links."
+  },
+  "paths": {
+    "/api/links": {
+      "post": {
+        "summary": "Ingest a new link",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "url": { "type": "string", "format": "uri" },
+                  "tags": { "type": "array", "items": { "type": "string" } },
+                  "metadata": { "type": "object" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Link ingested successfully" }
+        }
+      }
+    },
+    "/api/search": {
+      "get": {
+        "summary": "Search for links",
+        "parameters": [
+          { "name": "q", "in": "query", "schema": { "type": "string" } },
+          { "name": "tags", "in": "query", "schema": { "type": "string" } },
+          { "name": "mime", "in": "query", "schema": { "type": "string" } },
+          { "name": "limit", "in": "query", "schema": { "type": "integer" } },
+          { "name": "offset", "in": "query", "schema": { "type": "integer" } }
+        ],
+        "responses": {
+          "200": { "description": "Search results" }
+        }
+      }
+    },
+    "/api/suggest": {
+      "get": {
+        "summary": "Get tag suggestions",
+        "parameters": [
+          { "name": "partial", "in": "query", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Tag suggestions" }
+        }
+      }
+    },
+    "/api/query": {
+      "post": {
+        "summary": "Query for agents",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "naturalLanguageQuery": { "type": "string" },
+                  "filters": {
+                    "type": "object",
+                    "properties": {
+                      "tags": { "type": "array", "items": { "type": "string" } },
+                      "mime": { "type": "string" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Query results" }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "responses": {
+          "200": { "description": "Service is healthy" }
+        }
+      }
+    }
+  }
+}
