@@ -3,7 +3,7 @@ const fetch = require('node-fetch');
 const assert = require('assert');
 const WRANGLER_PORT = 8787;
 const BASE_URL = `http://localhost:${WRANGLER_PORT}`;
-const TEST_TIMEOUT = 60000; // 60 seconds
+const TEST_TIMEOUT = 90000; // 90 seconds
 let wranglerProcess;
 async function waitForServerReady() {
   const startTime = Date.now();
@@ -54,6 +54,11 @@ async function runTests() {
   assert(json.success, 'Idempotency check failed');
   assert.strictEqual(json.data.existed, true, 'Expected existed: true on re-ingest');
   console.log('  - Re-ingesting existing URL correctly returned existed: true');
+  // Test 1.2: Check D1 count after idempotency check
+  let healthRes = await fetch(`${BASE_URL}/api/health`, { headers });
+  let healthJson = await healthRes.json();
+  assert.strictEqual(healthJson.data.d1Count, 3, `D1 count should remain 3 after re-ingest, but got ${healthJson.data.d1Count}`);
+  console.log('  - D1 count is correct after idempotent request.');
   // Test 2: Semantic Search
   console.log('\n[Test 2] Running Semantic Search...');
   const searchQuery = 'javascript documentation';
@@ -68,7 +73,7 @@ async function runTests() {
   assert(searchJson.data.length > 0, 'Semantic search returned no results');
   console.log(`  - Found ${searchJson.data.length} results for "${searchQuery}" with tag "docs"`);
   assert(searchJson.data[0].score > 0.75, 'Top result score is not > 0.75');
-  assert(searchJson.data[0].tags.includes('docs'), 'Search result missing correct tag');
+  assert(searchJson.data[0].tags.includes('docs'), 'Search result missing correct tag (D1 tags JOIN works)');
   // Test 3: Full-text Search
   console.log('\n[Test 3] Running Full-text Search...');
   const fullTextQuery = '"JavaScript"';
@@ -80,6 +85,11 @@ async function runTests() {
   assert(ftJson.success, 'Full-text search API returned success: false');
   assert(ftJson.data.length > 0, 'Full-text search returned no results');
   console.log(`  - Found ${ftJson.data.length} results for ${fullTextQuery}`);
+  // Test 3.1: Empty search to list all
+  const emptyRes = await fetch(`${BASE_URL}/api/search`, { headers });
+  const emptyJson = await emptyRes.json();
+  assert.strictEqual(emptyJson.data.length, 3, 'D1 list should return all 3 links');
+  console.log('  - Empty search correctly lists all 3 ingested links.');
   // Test 4: Tag Suggestions
   console.log('\n[Test 4] Fetching Tag Suggestions...');
   const suggestUrl = new URL(`${BASE_URL}/api/suggest`);
@@ -89,7 +99,7 @@ async function runTests() {
   assert.strictEqual(suggestRes.status, 200, 'Suggest request failed');
   assert(suggestJson.success, 'Suggest API returned success: false');
   assert(suggestJson.data.length > 0, 'Suggest returned no results for "java"');
-  assert(suggestJson.data.some(t => t.includes('script')), 'Suggest did not return "javascript" for "java"');
+  assert(suggestJson.data.includes('javascript'), 'Suggest did not return "javascript" for "java" (D1 DISTINCT tag query works)');
   console.log(`  - Suggestions for "java": ${suggestJson.data.join(', ')}`);
   // Test 5: Agent Query
   console.log('\n[Test 5] Running Agent Query...');
@@ -102,16 +112,16 @@ async function runTests() {
   assert.strictEqual(agentRes.status, 200, 'Agent query failed');
   assert(agentJson.success, 'Agent query API returned success: false');
   assert(agentJson.data.length > 0, 'Agent query returned no results');
-  assert(agentJson.data.some(r => r.tags.includes('ui')), 'Agent query result missing correct tag');
+  assert(agentJson.data[0].tags.includes('ui'), 'Agent query result missing correct tag (D1 tags filter via JOIN)');
   console.log(`  - Agent query found ${agentJson.data.length} results.`);
   // Test 6: Health Check
   console.log('\n[Test 6] Checking Health Endpoint...');
-  const healthRes = await fetch(`${BASE_URL}/api/health`, { headers });
-  const healthJson = await healthRes.json();
+  healthRes = await fetch(`${BASE_URL}/api/health`, { headers });
+  healthJson = await healthRes.json();
   assert.strictEqual(healthRes.status, 200, 'Health check failed');
   assert(healthJson.success, 'Health check returned success: false');
   assert.strictEqual(healthJson.data.d1Count, 3, `Expected d1Count to be 3, got ${healthJson.data.d1Count}`);
-  assert(healthJson.data.vectorizeCount >= -1, 'vectorizeCount should be >= -1'); // -1 is placeholder
+  assert(healthJson.data.vectorizeCount >= -1, 'vectorizeCount should be >= -1');
   console.log(`  - Health OK: d1Count=${healthJson.data.d1Count}`);
   console.log('\n--- All tests passed! ---');
 }

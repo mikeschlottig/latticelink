@@ -9,6 +9,7 @@ export interface Env {
   GlobalDurableObject: DurableObjectNamespace<GlobalDurableObject>;
   AI?: Ai;
   VECTORIZE?: VectorizeIndex;
+  LINKS_D1?: D1Database;
 }
 type Doc<T> = { v: number; data: T };
 /**

@@ -47,7 +47,7 @@ Built entirely on Cloudflare's edge platform, LatticeLink leverages Workers for 
     # For local development
     bun run migrate:local
     # For production
-    bun run migrate:remote
+    bun run migrate
     ```
 ### Local Development
 Start the development server with local bindings:
@@ -108,8 +108,10 @@ curl http://localhost:8787/api/health
 ```
 The full API documentation is available via the OpenAPI spec at `/openapi.json`.
 ## Architecture
-The project uses a single Durable Object (`GlobalDurableObject`) to simulate a key-value store for local development, providing a consistent API for entities and indexes. In production, this pattern can be backed by D1 for relational data and Vectorize for vector search. The `wrangler.toml` file must be configured with the appropriate bindings for `LINKS_D1`, `VECTORIZE`, and `AI` for the deployed worker to function correctly.
+The project uses D1 for relational storage (links/tags tables), with a fallback to a Durable Object simulation if the D1 binding is absent in the local environment. Vectorize is used for vector search, and Workers AI for generating embeddings. The `wrangler.toml` file must be configured with the appropriate bindings for `LINKS_D1`, `VECTORIZE`, and `AI` for the deployed worker to function correctly.
 ## Troubleshooting
 - **Binding Errors**: If you see errors like `AI binding missing` or `VECTORIZE binding missing`, ensure your `wrangler.toml` is correctly configured and that the bindings are enabled in your Cloudflare account for the deployed worker.
+- **D1 Binding Missing**: Configure `wrangler.toml` and run `wrangler deploy`. For local development, ensure your local wrangler is up to date.
+- **Ingestion Idempotency**: D1's `UNIQUE` constraint on the `url` column handles duplicates gracefully.
 - **Local Dev Issues**: `wrangler dev` runs the worker locally. Ensure you have authenticated with `wrangler login`. For D1, local development uses a local SQLite file.
 [cloudflarebutton]

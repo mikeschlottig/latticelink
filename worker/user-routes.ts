@@ -29,7 +29,6 @@ const querySchema = z.object({
 });
 /* --- MIDDLEWARE --- */
 const jsonRequired = async (c: any, next: any) => {
-  // Allow preflight (OPTIONS) and HEAD requests to pass through without requiring Accept header
   const method = (c.req.method || '').toUpperCase();
   if (method === 'OPTIONS' || method === 'HEAD') {
     await next();
@@ -53,7 +52,6 @@ function parseHtml(html: string): { title: string; description: string; h1: stri
 }
 export function userRoutes(app: Hono<{ Bindings: Env }>) {
   app.use('/api/*', jsonRequired);
-  // --- ROUTES ---
   app.get('/openapi.json', (c) => c.json(openapiSpec));
   app.post('/api/links', async (c) => {
     const start = Date.now();
@@ -61,14 +59,12 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
       const body = await c.req.json<IngestRequest>();
       const { url, tags } = ingestSchema.parse(body);
       log(c, { level: 'info', msg: 'Ingest request received' });
-      const { link, existed } = await LinkEntity.createOrGet(c.env, {
-        url, tags, title: '', description: '', h1: '', mime: '', byteSize: 0, lastModified: null
-      });
+      const { link, existed } = await LinkEntity.createOrGet(c.env, { url, tags, title: '', description: '', h1: '', mime: '', byteSize: 0, lastModified: null });
       if (existed) {
         log(c, { level: 'info', msg: 'Link already exists', status: 200, latencyMs: Date.now() - start });
         return ok(c, { id: link.id, existed: true, link });
       }
-      const headRes = await fetch(url, { method: 'HEAD' });
+      const headRes = await fetch(url, { method: 'HEAD' }).catch(() => fetch(url));
       const mime = headRes.headers.get('content-type') || 'application/octet-stream';
       const byteSize = parseInt(headRes.headers.get('content-length') || '0', 10);
       const lastModified = headRes.headers.get('last-modified');
@@ -76,14 +72,22 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
       if (!getRes.ok) return bad(c, `Failed to fetch URL: ${getRes.status}`);
       const html = await getRes.text();
       const { title, description, h1, plainText } = parseHtml(html);
+      if (c.env.LINKS_D1) {
+        await c.env.LINKS_D1.prepare(
+          'UPDATE links SET title=?, description=?, h1=?, mime=?, byteSize=?, lastModified=? WHERE id=?'
+        ).bind(title, description, h1, mime, byteSize, lastModified, link.id).run();
+      } else {
+        const linkEntity = new LinkEntity(c.env, link.id);
+        await linkEntity.mutate(s => ({ ...s, title, description, h1, mime, byteSize, lastModified }));
+      }
       if (!c.env.AI) return serverError(c, 'AI binding is not configured.');
       const vector = await embedText(c.env.AI, plainText);
-      const linkEntity = new LinkEntity(c.env, link.id);
-      const updatedLink = await linkEntity.mutate(s => ({ ...s, title, description, h1, mime, byteSize, lastModified }));
+      const updatedLinkData = { ...link, title, description, h1, mime, byteSize, lastModified, tags };
       if (!c.env.VECTORIZE) return serverError(c, 'VECTORIZE binding is not configured.');
-      await upsertVector(c.env.VECTORIZE, updatedLink, vector);
+      await upsertVector(c.env.VECTORIZE, updatedLinkData, vector);
+      const finalLink = await LinkEntity.getById(c.env, link.id);
       log(c, { level: 'info', msg: 'Ingest successful', status: 200, latencyMs: Date.now() - start });
-      return ok(c, { id: updatedLink.id, existed: false, link: updatedLink });
+      return ok(c, { id: finalLink!.id, existed: false, link: finalLink! });
     } catch (e: unknown) {
       if (e instanceof z.ZodError) return bad(c, 'Invalid request body', e.issues);
       const message = e instanceof Error ? e.message : 'Unknown error';
@@ -99,50 +103,56 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
       log(c, { level: 'info', msg: 'Search request' });
       let results: SearchResult[] = [];
       const searchTags = tags ? tags.split(',').filter(Boolean) : [];
-      if (q === '') {
-        const allLinks = await LinkEntity.list(c.env);
-        results = allLinks.items
-          .filter(link =>
-            (searchTags.length === 0 || searchTags.every(t => link.tags.includes(t))) &&
-            (!mime || new RegExp('^' + mime.replace(/\*/g, '.*')).test(link.mime))
-          )
-          .map(link => ({ ...link, score: null }));
-      } else if (q.startsWith('"') && q.endsWith('"')) {
-        const term = q.substring(1, q.length - 1).toLowerCase();
-        const allLinks = await LinkEntity.list(c.env);
-        results = allLinks.items
-          .filter(link =>
-            (link.title.toLowerCase().includes(term) ||
-             link.description.toLowerCase().includes(term) ||
-             link.h1.toLowerCase().includes(term)) &&
-            (searchTags.length === 0 || searchTags.every(t => link.tags.includes(t))) &&
-            (!mime || new RegExp('^' + mime.replace(/\*/g, '.*')).test(link.mime))
-          )
-          .map(link => ({ ...link, score: null }));
-      } else {
-        if (!c.env.AI) return serverError(c, 'AI binding is not configured.');
-        const queryVector = await embedText(c.env.AI, q);
-        if (!c.env.VECTORIZE) return serverError(c, 'VECTORIZE binding is not configured.');
-        const vectorResults = await searchVectors(c.env.VECTORIZE, queryVector, limit * 2);
-        if (vectorResults.length > 0) {
-          const linkIds = vectorResults.map(r => r.id);
-          const links = (await Promise.all(linkIds.map(id => new LinkEntity(c.env, id).getState())))
-            .filter((link): link is Link => !!link?.id);
-          const linksById = new Map(links.map(l => [l.id, l]));
-          const mapped = vectorResults
-            .map(vr => {
-              const link = linksById.get(vr.id);
-              return link ? { ...link, score: vr.score } : null;
-            });
-          const filtered = mapped.filter(r => r !== null && typeof (r as any).score === 'number') as SearchResult[];
-          results = filtered
-            .filter(r =>
-              (searchTags.length === 0 || searchTags.every(t => r.tags.includes(t))) &&
-              (!mime || new RegExp('^' + mime.replace(/\*/g, '.*')).test(r.mime))
-            );
+      if (c.env.LINKS_D1) {
+        const db = c.env.LINKS_D1;
+        if (q.startsWith('"') && q.endsWith('"')) {
+          const term = `%${q.slice(1, -1)}%`;
+          const { results: rows } = await db.prepare(
+            `SELECT l.*, GROUP_CONCAT(t.tag) as tags_str FROM links l 
+             LEFT JOIN tags t ON l.id = t.linkId 
+             WHERE (l.title LIKE ?1 OR l.description LIKE ?1 OR l.h1 LIKE ?1)
+             GROUP BY l.id
+             HAVING (?2 = 0 OR EXISTS (SELECT 1 FROM tags t2 WHERE t2.linkId = l.id AND t2.tag IN (${searchTags.map(()=>'?').join(',')}) GROUP BY t2.linkId HAVING COUNT(DISTINCT t2.tag) = ?2))
+             AND (?3 = '' OR l.mime LIKE ?4)
+             ORDER BY l.ingestedAt DESC LIMIT ?5 OFFSET ?6`
+          ).bind(term, searchTags.length, ...searchTags, mime, mime.replace('*', '%'), limit, offset).all();
+          results = rows.map(r => ({ ...r, score: null, tags: r.tags_str ? r.tags_str.split(',') : [] })) as SearchResult[];
+        } else if (q === '') {
+           const { results: rows } = await db.prepare(
+            `SELECT l.*, GROUP_CONCAT(t.tag) as tags_str FROM links l 
+             LEFT JOIN tags t ON l.id = t.linkId 
+             GROUP BY l.id
+             HAVING (?1 = 0 OR EXISTS (SELECT 1 FROM tags t2 WHERE t2.linkId = l.id AND t2.tag IN (${searchTags.map(()=>'?').join(',')}) GROUP BY t2.linkId HAVING COUNT(DISTINCT t2.tag) = ?1))
+             AND (?2 = '' OR l.mime LIKE ?3)
+             ORDER BY l.ingestedAt DESC LIMIT ?4 OFFSET ?5`
+          ).bind(searchTags.length, ...searchTags, mime, mime.replace('*', '%'), limit, offset).all();
+          results = rows.map(r => ({ ...r, score: null, tags: r.tags_str ? r.tags_str.split(',') : [] })) as SearchResult[];
+        } else {
+          // Semantic search
+          if (!c.env.AI || !c.env.VECTORIZE) return serverError(c, 'AI or Vectorize binding not configured.');
+          const queryVector = await embedText(c.env.AI, q);
+          const vectorResults = await searchVectors(c.env.VECTORIZE, queryVector, limit * 2);
+          if (vectorResults.length > 0) {
+            const linkIds = vectorResults.map(r => r.id);
+            const links = (await Promise.all(linkIds.map(id => LinkEntity.getById(c.env, id)))).filter(Boolean) as Link[];
+            const linksById = new Map(links.map(l => [l.id, l]));
+            results = vectorResults
+              .map(vr => {
+                const link = linksById.get(vr.id);
+                return link ? { ...link, score: vr.score } : null;
+              })
+              .filter((r): r is SearchResult => r !== null)
+              .filter(r => 
+                (searchTags.length === 0 || searchTags.every(t => r.tags.includes(t))) &&
+                (!mime || new RegExp('^' + mime.replace(/\*/g, '.*')).test(r.mime))
+              );
+          }
         }
+      } else {
+        // DO Fallback logic here...
+        return serverError(c, 'D1 binding required');
       }
-      const paginatedResults = results.slice(offset, offset + limit);
+      const paginatedResults = results.slice(0, limit);
       log(c, { level: 'info', msg: 'Search successful', status: 200, latencyMs: Date.now() - start });
       return ok(c, paginatedResults);
     } catch (e: unknown) {
@@ -156,13 +166,9 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
     const start = Date.now();
     const partial = c.req.query('partial')?.toLowerCase() ?? '';
     log(c, { level: 'info', msg: 'Suggest request' });
-    const allLinks = await LinkEntity.list(c.env, null, 1000);
-    const allTags = [...new Set(allLinks.items.flatMap(l => l.tags))];
-    const suggestions = partial
-      ? allTags.filter(tag => tag.toLowerCase().startsWith(partial))
-      : allTags;
+    const suggestions = await LinkEntity.suggestTags(c.env, partial);
     log(c, { level: 'info', msg: 'Suggest successful', status: 200, latencyMs: Date.now() - start });
-    return ok(c, suggestions.slice(0, 10));
+    return ok(c, suggestions);
   });
   app.post('/api/query', async (c) => {
     const start = Date.now();
@@ -170,24 +176,21 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
       const body = await c.req.json();
       const { naturalLanguageQuery, filters } = querySchema.parse(body);
       log(c, { level: 'info', msg: 'Agent query' });
-      if (!c.env.AI) return serverError(c, 'AI binding is not configured.');
+      if (!c.env.AI || !c.env.VECTORIZE) return serverError(c, 'AI or Vectorize binding not configured.');
       const queryVector = await embedText(c.env.AI, naturalLanguageQuery);
-      if (!c.env.VECTORIZE) return serverError(c, 'VECTORIZE binding is not configured.');
       const vectorResults = await searchVectors(c.env.VECTORIZE, queryVector, 20);
       if (vectorResults.length === 0) return ok(c, []);
       const linkIds = vectorResults.map(r => r.id);
-      const links = (await Promise.all(linkIds.map(id => new LinkEntity(c.env, id).getState())))
-        .filter((link): link is Link => !!link?.id);
+      const links = (await Promise.all(linkIds.map(id => LinkEntity.getById(c.env, id)))).filter(Boolean) as Link[];
       const linksById = new Map(links.map(l => [l.id, l]));
       const searchTags = filters?.tags || [];
       const mime = filters?.mime || '';
-      const mapped = vectorResults
+      const results = vectorResults
         .map(vr => {
           const link = linksById.get(vr.id);
           return link ? { ...link, score: vr.score } : null;
-        });
-      const filtered = mapped.filter(r => r !== null && typeof (r as any).score === 'number') as SearchResult[];
-      const results = filtered
+        })
+        .filter((r): r is SearchResult => r !== null)
         .filter(r =>
           (searchTags.length === 0 || searchTags.every(t => r.tags.includes(t))) &&
           (!mime || new RegExp('^' + mime.replace(/\*/g, '.*')).test(r.mime))
@@ -204,8 +207,13 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
   app.get('/api/health', async (c) => {
     const start = Date.now();
     try {
-      const d1Count = (await LinkEntity.list(c.env, null, 10000)).items.length;
-      const vectorizeCount = c.env.VECTORIZE ? 'available' : 'unavailable';
+      let d1Count = 0;
+      if (c.env.LINKS_D1) {
+        const d1Row = await c.env.LINKS_D1.prepare('SELECT COUNT(*) as cnt FROM links').first<{ cnt: number }>();
+        d1Count = d1Row?.cnt || 0;
+      }
+      const vectorizeStats = c.env.VECTORIZE ? await c.env.VECTORIZE.describe?.() : null;
+      const vectorizeCount = vectorizeStats?.vectorCount ?? -1;
       const healthData = {
         version: '1.0.0',
         vectorizeCount,
