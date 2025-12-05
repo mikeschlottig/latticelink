@@ -35,7 +35,6 @@ const jsonRequired = async (c: any, next: any) => {
   await next();
 };
 // --- HELPERS ---
-// A very simple parser to extract metadata. A real app would use a robust library.
 function parseHtml(html: string): { title: string; description: string; h1: string; plainText: string } {
   const title = html.match(/<title>(.*?)<\/title>/i)?.[1] || '';
   const description = html.match(/<meta\s+name="description"\s+content="(.*?)"/i)?.[1] || '';
@@ -55,51 +54,43 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
     try {
       const body = await c.req.json<IngestRequest>();
       const { url, tags } = ingestSchema.parse(body);
-      log(c, { level: 'info', msg: 'Ingest request received', url });
-      // Check for existing link first
-      const urlIndex = new LinkEntity(c.env, `link-url:${url}`);
-      const existingId = (await urlIndex.getState()).id;
-      if (existingId) {
-        const existingLink = new LinkEntity(c.env, existingId);
-        const linkData = await existingLink.getState();
+      log(c, { level: 'info', msg: 'Ingest request received' });
+      const { link, existed } = await LinkEntity.createOrGet(c.env, {
+        url, tags, title: '', description: '', h1: '', mime: '', byteSize: 0, lastModified: null
+      });
+      if (existed) {
         log(c, { level: 'info', msg: 'Link already exists', status: 200, latencyMs: Date.now() - start });
-        return ok(c, { id: linkData.id, existed: true, link: linkData });
+        return ok(c, { id: link.id, existed: true, link });
       }
-      // HEAD request to get headers
       const headRes = await fetch(url, { method: 'HEAD' });
       const mime = headRes.headers.get('content-type') || 'application/octet-stream';
       const byteSize = parseInt(headRes.headers.get('content-length') || '0', 10);
       const lastModified = headRes.headers.get('last-modified');
-      // Fetch full content
       const getRes = await fetch(url);
       if (!getRes.ok) return bad(c, `Failed to fetch URL: ${getRes.status}`);
       const html = await getRes.text();
       const { title, description, h1, plainText } = parseHtml(html);
-      // Embed text
       const vector = await embedText(c.env.AI, plainText);
-      // Create entity in DO (simulated D1)
-      const { link, existed } = await LinkEntity.createOrGet(c.env, {
-        url, title, description, h1, mime, byteSize, lastModified, tags
-      });
-      // Upsert vector
-      await upsertVector(c.env.VECTORIZE, link, vector);
+      const linkEntity = new LinkEntity(c.env, link.id);
+      const updatedLink = await linkEntity.mutate(s => ({ ...s, title, description, h1, mime, byteSize, lastModified }));
+      await upsertVector(c.env.VECTORIZE, updatedLink, vector);
       log(c, { level: 'info', msg: 'Ingest successful', status: 200, latencyMs: Date.now() - start });
-      return ok(c, { id: link.id, existed, link });
+      return ok(c, { id: updatedLink.id, existed: false, link: updatedLink });
     } catch (e: any) {
       if (e instanceof z.ZodError) return bad(c, 'Invalid request body', e.issues);
-      log(c, { level: 'error', msg: 'Ingest failed', error: e.message });
+      log(c, { level: 'error', msg: `Ingest failed: ${e.message}` });
       return serverError(c, 'Ingestion failed');
     }
   });
   app.get('/api/search', async (c) => {
     const start = Date.now();
     try {
-      const queryParams = c.req.query();
+      const queryParams = Object.fromEntries(new URL(c.req.url).searchParams);
       const { q, tags, mime, limit, offset } = searchSchema.parse(queryParams);
-      log(c, { level: 'info', msg: 'Search request', ...queryParams });
+      log(c, { level: 'info', msg: 'Search request' });
       let results: SearchResult[] = [];
       const searchTags = tags ? tags.split(',').filter(Boolean) : [];
-      if (q.startsWith('"') && q.endsWith('"')) { // Full-text search
+      if (q.startsWith('"') && q.endsWith('"')) {
         const term = q.substring(1, q.length - 1).toLowerCase();
         const allLinks = await LinkEntity.list(c.env);
         results = allLinks.items
@@ -111,13 +102,13 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
             (!mime || new RegExp('^' + mime.replace(/\*/g, '.*')).test(link.mime))
           )
           .map(link => ({ ...link, score: null }));
-      } else { // Semantic search
+      } else {
         const queryVector = await embedText(c.env.AI, q);
-        const vectorResults = await searchVectors(c.env.VECTORIZE, queryVector, limit * 2); // Fetch more to filter
+        const vectorResults = await searchVectors(c.env.VECTORIZE, queryVector, limit * 2);
         if (vectorResults.length > 0) {
           const linkIds = vectorResults.map(r => r.id);
           const links = (await Promise.all(linkIds.map(id => new LinkEntity(c.env, id).getState())))
-            .filter((link): link is Link => !!link.id); // Filter out null/empty states
+            .filter((link): link is Link => !!link?.id);
           const linksById = new Map(links.map(l => [l.id, l]));
           results = vectorResults
             .map(vr => {
@@ -125,7 +116,7 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
               return link ? { ...link, score: vr.score } : null;
             })
             .filter((r): r is SearchResult => r !== null)
-            .filter(r => 
+            .filter(r =>
               (searchTags.length === 0 || searchTags.every(t => r.tags.includes(t))) &&
               (!mime || new RegExp('^' + mime.replace(/\*/g, '.*')).test(r.mime))
             );
@@ -136,15 +127,15 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
       return ok(c, paginatedResults);
     } catch (e: any) {
       if (e instanceof z.ZodError) return bad(c, 'Invalid query parameters', e.issues);
-      log(c, { level: 'error', msg: 'Search failed', error: e.message });
+      log(c, { level: 'error', msg: `Search failed: ${e.message}` });
       return serverError(c, 'Search failed');
     }
   });
   app.get('/api/suggest', async (c) => {
     const start = Date.now();
     const partial = c.req.query('partial')?.toLowerCase() ?? '';
-    log(c, { level: 'info', msg: 'Suggest request', partial });
-    const allLinks = await LinkEntity.list(c.env, null, 1000); // Limit for performance
+    log(c, { level: 'info', msg: 'Suggest request' });
+    const allLinks = await LinkEntity.list(c.env, null, 1000);
     const allTags = [...new Set(allLinks.items.flatMap(l => l.tags))];
     const suggestions = partial
       ? allTags.filter(tag => tag.toLowerCase().startsWith(partial))
@@ -157,16 +148,13 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
     try {
       const body = await c.req.json();
       const { naturalLanguageQuery, filters } = querySchema.parse(body);
-      log(c, { level: 'info', msg: 'Agent query', query: naturalLanguageQuery });
-      // This logic mirrors /api/search, making it a single entry point for agents
+      log(c, { level: 'info', msg: 'Agent query' });
       const queryVector = await embedText(c.env.AI, naturalLanguageQuery);
       const vectorResults = await searchVectors(c.env.VECTORIZE, queryVector, 20);
-      if (vectorResults.length === 0) {
-        return ok(c, []);
-      }
+      if (vectorResults.length === 0) return ok(c, []);
       const linkIds = vectorResults.map(r => r.id);
       const links = (await Promise.all(linkIds.map(id => new LinkEntity(c.env, id).getState())))
-        .filter((link): link is Link => !!link.id);
+        .filter((link): link is Link => !!link?.id);
       const linksById = new Map(links.map(l => [l.id, l]));
       const searchTags = filters?.tags || [];
       const mime = filters?.mime || '';
@@ -176,7 +164,7 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
           return link ? { ...link, score: vr.score } : null;
         })
         .filter((r): r is SearchResult => r !== null)
-        .filter(r => 
+        .filter(r =>
           (searchTags.length === 0 || searchTags.every(t => r.tags.includes(t))) &&
           (!mime || new RegExp('^' + mime.replace(/\*/g, '.*')).test(r.mime))
         );
@@ -184,17 +172,15 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
       return ok(c, results);
     } catch (e: any) {
       if (e instanceof z.ZodError) return bad(c, 'Invalid request body', e.issues);
-      log(c, { level: 'error', msg: 'Agent query failed', error: e.message });
+      log(c, { level: 'error', msg: `Agent query failed: ${e.message}` });
       return serverError(c, 'Agent query failed');
     }
   });
   app.get('/api/health', async (c) => {
     const start = Date.now();
     try {
-      const d1Count = (await LinkEntity.list(c.env)).items.length;
-      // Vectorize count is not directly exposed, so we return a placeholder.
-      // A real app might track this separately or use a different metric.
-      const vectorizeCount = -1; // Placeholder
+      const d1Count = (await LinkEntity.list(c.env, null, 10000)).items.length;
+      const vectorizeCount = -1; // Placeholder, not directly available
       const healthData = {
         version: '1.0.0',
         vectorizeCount,
@@ -205,7 +191,7 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
       log(c, { level: 'info', msg: 'Health check successful', status: 200, latencyMs: Date.now() - start });
       return ok(c, healthData);
     } catch (e: any) {
-      log(c, { level: 'error', msg: 'Health check failed', error: e.message });
+      log(c, { level: 'error', msg: `Health check failed: ${e.message}` });
       return serverError(c, 'Health check failed');
     }
   });

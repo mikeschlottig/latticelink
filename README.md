@@ -45,9 +45,9 @@ Built entirely on Cloudflare's edge platform, LatticeLink leverages Workers for 
 4.  Run the D1 database migrations:
     ```bash
     # For local development
-    wrangler d1 execute latticelink-db --local --file=worker/schema.sql
+    bun run migrate:local
     # For production
-    wrangler d1 execute latticelink-db --remote --file=worker/schema.sql
+    bun run migrate:remote
     ```
 ### Local Development
 Start the development server with local bindings:
@@ -78,6 +78,11 @@ curl -X POST http://localhost:8787/api/links \
   -H "Content-Type: application/json" \
   -d '{"url": "https://www.cloudflare.com/learning/", "tags": ["web", "cloudflare", "docs"]}'
 ```
+#### Idempotent Ingestion
+Running the same command again will return the existing link with `existed: true`.
+```bash
+# Returns { "success": true, "data": { "id": "...", "existed": true, "link": { ... } } }
+```
 #### Semantic Search
 ```bash
 curl "http://localhost:8787/api/search?q=serverless%20computing&tags=cloudflare"
@@ -102,4 +107,9 @@ curl -X POST http://localhost:8787/api/query \
 curl http://localhost:8787/api/health
 ```
 The full API documentation is available via the OpenAPI spec at `/openapi.json`.
+## Architecture
+The project uses a single Durable Object (`GlobalDurableObject`) to simulate a key-value store for local development, providing a consistent API for entities and indexes. In production, this pattern can be backed by D1 for relational data and Vectorize for vector search. The `wrangler.toml` file must be configured with the appropriate bindings for `LINKS_D1`, `VECTORIZE`, and `AI` for the deployed worker to function correctly.
+## Troubleshooting
+- **Binding Errors**: If you see errors like `AI binding missing` or `VECTORIZE binding missing`, ensure your `wrangler.toml` is correctly configured and that the bindings are enabled in your Cloudflare account for the deployed worker.
+- **Local Dev Issues**: `wrangler dev` runs the worker locally. Ensure you have authenticated with `wrangler login`. For D1, local development uses a local SQLite file.
 [cloudflarebutton]

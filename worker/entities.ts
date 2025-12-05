@@ -1,6 +1,11 @@
-import { IndexedEntity, type Env } from "./core-utils";
+import { IndexedEntity, Entity, Index, type Env } from "./core-utils";
 import type { Link } from "@shared/types";
 export type LinkState = Link;
+// A simple entity to map a URL to a Link ID for idempotency checks.
+class UrlIndexEntity extends Entity<{ id: string }> {
+  static readonly entityName = "url-index";
+  static readonly initialState = { id: "" };
+}
 export class LinkEntity extends IndexedEntity<LinkState> {
   static readonly entityName = "link";
   static readonly indexName = "links";
@@ -21,11 +26,8 @@ export class LinkEntity extends IndexedEntity<LinkState> {
    * Idempotency is based on the URL.
    */
   static async createOrGet(env: Env, state: Omit<LinkState, 'id' | 'ingestedAt'>): Promise<{ link: LinkState, existed: boolean }> {
-    // We use a separate index for URL -> ID mapping to check for existence
-    // This is more efficient than listing all entities.
-    const urlIndex = new IndexedEntity< { id: string } >(env, `link-url:${state.url}`);
-    await urlIndex.getState(); // ensure state is loaded
-    const existingId = urlIndex.state.id;
+    const urlIndex = new UrlIndexEntity(env, state.url);
+    const existingId = (await urlIndex.getState()).id;
     if (existingId) {
       const existingLink = new LinkEntity(env, existingId);
       return { link: await existingLink.getState(), existed: true };
@@ -39,17 +41,18 @@ export class LinkEntity extends IndexedEntity<LinkState> {
     const inst = new this(env, id);
     await inst.save(newState);
     // Add to main ID index
-    const idx = new this(env, this.indexName)._getIndex();
+    const idx = new Index<string>(env, this.indexName);
     await idx.add(id);
     // Add to URL -> ID index
     await urlIndex.save({ id });
-    const urlIdx = new this(env, `index:link-urls`)._getIndex();
-    await urlIdx.add(state.url);
     return { link: newState, existed: false };
   }
   // Helper to get the underlying index instance
-  _getIndex() {
+  protected _getIndex() {
     const Ctor = this.constructor as typeof LinkEntity;
     return new (this._getIndexClass())(this.env, Ctor.indexName);
+  }
+  protected _getIndexClass() {
+    return Index;
   }
 }
