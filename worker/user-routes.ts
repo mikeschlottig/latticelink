@@ -1,30 +1,22 @@
 import { Hono } from "hono";
 import { z } from 'zod';
-import { zValidator } from '@hono/zod-validator';
 import type { Env } from './core-utils';
-import { ok, bad, notFound } from './core-utils';
+import { ok, bad, notFound, serverError } from './core-utils';
 import { log } from './observability';
 import openapiSpec from '../openapi.json';
-// --- MOCK DATA FOR PHASE 1 ---
-const MOCK_LINKS = [
-  { id: '1', url: 'https://developer.mozilla.org/en-US/docs/Web/JavaScript', title: 'JavaScript | MDN', description: 'JavaScript (JS) is a lightweight, interpreted, or just-in-time compiled programming language with first-class functions.', tags: ['javascript', 'webdev', 'docs'], score: 0.92, metadata: { mime: 'text/html', byteSize: 150000, lastModified: '2023-10-26T10:00:00Z' } },
-  { id: '2', url: 'https://github.com', title: 'GitHub: Let\'s build from here', description: 'GitHub is where over 100 million developers shape the future of software, together.', tags: ['git', 'collaboration', 'code'], score: 0.88, metadata: { mime: 'text/html', byteSize: 200000, lastModified: '2023-10-26T11:00:00Z' } },
-  { id: '3', url: 'https://stackoverflow.com', title: 'Stack Overflow - Where Developers Learn, Share, & Build Careers', description: 'A public platform building the definitive collection of coding questions & answers.', tags: ['q&a', 'community', 'code'], score: 0.81, metadata: { mime: 'text/html', byteSize: 250000, lastModified: '2023-10-26T12:00:00Z' } },
-  { id: '4', url: 'https://www.cloudflare.com/learning/serverless/what-is-serverless/', title: 'What is Serverless Computing? | Cloudflare', description: 'Serverless computing is a method of providing backend services on an as-used basis.', tags: ['serverless', 'cloudflare', 'cloud'], score: 0.95, metadata: { mime: 'text/html', byteSize: 120000, lastModified: '2023-10-25T09:00:00Z' } },
-  { id: '5', url: 'https://react.dev/', title: 'React', description: 'The library for web and native user interfaces.', tags: ['react', 'javascript', 'ui'], score: null, metadata: { mime: 'text/html', byteSize: 180000, lastModified: '2023-10-24T14:00:00Z' } },
-  { id: '6', url: 'https://tailwindcss.com/', title: 'Tailwind CSS - Rapidly build modern websites without ever leaving your HTML.', description: 'A utility-first CSS framework packed with classes like flex, pt-4, text-center and rotate-90 that can be composed to build any design, directly in your markup.', tags: ['css', 'utility-first', 'design'], score: null, metadata: { mime: 'image/png', byteSize: 50000, lastModified: '2023-10-23T18:00:00Z' } },
-];
-const ALL_TAGS = [...new Set(MOCK_LINKS.flatMap(l => l.tags))];
+import { LinkEntity } from './entities';
+import { embedText, searchVectors, upsertVector } from './vectorize-client';
+import type { IngestRequest, Link, SearchResult } from "@shared/types";
 // --- ZOD SCHEMAS for validation ---
 const ingestSchema = z.object({
   url: z.string().url(),
-  tags: z.array(z.string()).optional(),
+  tags: z.array(z.string()).optional().default([]),
   metadata: z.record(z.unknown()).optional(),
 });
 const searchSchema = z.object({
-  q: z.string().optional(),
-  tags: z.string().optional(),
-  mime: z.string().optional(),
+  q: z.string().optional().default(''),
+  tags: z.string().optional().default(''),
+  mime: z.string().optional().default(''),
   limit: z.coerce.number().int().min(1).max(100).default(20),
   offset: z.coerce.number().int().min(0).default(0),
 });
@@ -37,91 +29,184 @@ const querySchema = z.object({
 });
 // --- MIDDLEWARE ---
 const jsonRequired = async (c: any, next: any) => {
-  if (c.req.header('Accept') !== 'application/json') {
-    return bad(c, 'Accept header must be application/json');
+  if (!c.req.header('Accept')?.includes('application/json')) {
+    return bad(c, 'Accept header must include application/json');
   }
   await next();
 };
+// --- HELPERS ---
+// A very simple parser to extract metadata. A real app would use a robust library.
+function parseHtml(html: string): { title: string; description: string; h1: string; plainText: string } {
+  const title = html.match(/<title>(.*?)<\/title>/i)?.[1] || '';
+  const description = html.match(/<meta\s+name="description"\s+content="(.*?)"/i)?.[1] || '';
+  const h1 = html.match(/<h1.*?>(.*?)<\/h1>/i)?.[1] || '';
+  const plainText = html.replace(/<style[^>]*>.*<\/style>/gs, ' ')
+                         .replace(/<script[^>]*>.*<\/script>/gs, ' ')
+                         .replace(/<[^>]+>/g, ' ')
+                         .replace(/\s+/g, ' ').trim();
+  return { title, description, h1, plainText: `${title} ${h1} ${description} ${plainText.slice(0, 2000)}` };
+}
 export function userRoutes(app: Hono<{ Bindings: Env }>) {
   app.use('/api/*', jsonRequired);
   // --- ROUTES ---
   app.get('/openapi.json', (c) => c.json(openapiSpec));
-  app.post('/api/links', zValidator('json', ingestSchema), async (c) => {
+  app.post('/api/links', async (c) => {
     const start = Date.now();
-    const body = c.req.valid('json');
-    log(c, { level: 'info', msg: 'Ingest request received' });
-    // Phase 1: Acknowledge and return mock success
-    const mockId = String(MOCK_LINKS.length + 1);
-    const response = { id: mockId, ...body };
-    log(c, { level: 'info', msg: 'Ingest successful', status: 200, latencyMs: Date.now() - start });
-    return ok(c, response);
-  });
-  app.get('/api/search', zValidator('query', searchSchema), async (c) => {
-    const start = Date.now();
-    const { q, tags, mime, limit, offset } = c.req.valid('query');
-    log(c, { level: 'info', msg: 'Search request received', ...c.req.valid('query') });
-    let results = [...MOCK_LINKS];
-    // Mock filtering logic
-    if (tags) {
-      const searchTags = tags.split(',');
-      results = results.filter(link => searchTags.every(tag => link.tags.includes(tag)));
-    }
-    if (mime) {
-      const mimePattern = new RegExp('^' + mime.replace(/\*/g, '.*') + '$');
-      results = results.filter(link => mimePattern.test(link.metadata.mime));
-    }
-    if (q) {
-      const query = q.toLowerCase();
-      if (query.startsWith('"') && query.endsWith('"')) {
-        // Full-text search mock
-        const term = query.substring(1, query.length - 1);
-        results = results.filter(link =>
-          link.title.toLowerCase().includes(term) ||
-          link.description.toLowerCase().includes(term)
-        );
-      } else {
-        // Semantic search mock - just re-order and filter slightly
-        results = results.filter(link =>
-          link.title.toLowerCase().includes(query) ||
-          link.description.toLowerCase().includes(query) ||
-          link.tags.some(t => t.includes(query))
-        ).sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    try {
+      const body = await c.req.json<IngestRequest>();
+      const { url, tags } = ingestSchema.parse(body);
+      log(c, { level: 'info', msg: 'Ingest request received', url });
+      // Check for existing link first
+      const urlIndex = new LinkEntity(c.env, `link-url:${url}`);
+      const existingId = (await urlIndex.getState()).id;
+      if (existingId) {
+        const existingLink = new LinkEntity(c.env, existingId);
+        const linkData = await existingLink.getState();
+        log(c, { level: 'info', msg: 'Link already exists', status: 200, latencyMs: Date.now() - start });
+        return ok(c, { id: linkData.id, existed: true, link: linkData });
       }
+      // HEAD request to get headers
+      const headRes = await fetch(url, { method: 'HEAD' });
+      const mime = headRes.headers.get('content-type') || 'application/octet-stream';
+      const byteSize = parseInt(headRes.headers.get('content-length') || '0', 10);
+      const lastModified = headRes.headers.get('last-modified');
+      // Fetch full content
+      const getRes = await fetch(url);
+      if (!getRes.ok) return bad(c, `Failed to fetch URL: ${getRes.status}`);
+      const html = await getRes.text();
+      const { title, description, h1, plainText } = parseHtml(html);
+      // Embed text
+      const vector = await embedText(c.env.AI, plainText);
+      // Create entity in DO (simulated D1)
+      const { link, existed } = await LinkEntity.createOrGet(c.env, {
+        url, title, description, h1, mime, byteSize, lastModified, tags
+      });
+      // Upsert vector
+      await upsertVector(c.env.VECTORIZE, link, vector);
+      log(c, { level: 'info', msg: 'Ingest successful', status: 200, latencyMs: Date.now() - start });
+      return ok(c, { id: link.id, existed, link });
+    } catch (e: any) {
+      if (e instanceof z.ZodError) return bad(c, 'Invalid request body', e.issues);
+      log(c, { level: 'error', msg: 'Ingest failed', error: e.message });
+      return serverError(c, 'Ingestion failed');
     }
-    const paginatedResults = results.slice(offset, offset + limit);
-    log(c, { level: 'info', msg: 'Search successful', status: 200, latencyMs: Date.now() - start });
-    return ok(c, paginatedResults);
+  });
+  app.get('/api/search', async (c) => {
+    const start = Date.now();
+    try {
+      const queryParams = c.req.query();
+      const { q, tags, mime, limit, offset } = searchSchema.parse(queryParams);
+      log(c, { level: 'info', msg: 'Search request', ...queryParams });
+      let results: SearchResult[] = [];
+      const searchTags = tags ? tags.split(',').filter(Boolean) : [];
+      if (q.startsWith('"') && q.endsWith('"')) { // Full-text search
+        const term = q.substring(1, q.length - 1).toLowerCase();
+        const allLinks = await LinkEntity.list(c.env);
+        results = allLinks.items
+          .filter(link =>
+            (link.title.toLowerCase().includes(term) ||
+             link.description.toLowerCase().includes(term) ||
+             link.h1.toLowerCase().includes(term)) &&
+            (searchTags.length === 0 || searchTags.every(t => link.tags.includes(t))) &&
+            (!mime || new RegExp('^' + mime.replace(/\*/g, '.*')).test(link.mime))
+          )
+          .map(link => ({ ...link, score: null }));
+      } else { // Semantic search
+        const queryVector = await embedText(c.env.AI, q);
+        const vectorResults = await searchVectors(c.env.VECTORIZE, queryVector, limit * 2); // Fetch more to filter
+        if (vectorResults.length > 0) {
+          const linkIds = vectorResults.map(r => r.id);
+          const links = (await Promise.all(linkIds.map(id => new LinkEntity(c.env, id).getState())))
+            .filter((link): link is Link => !!link.id); // Filter out null/empty states
+          const linksById = new Map(links.map(l => [l.id, l]));
+          results = vectorResults
+            .map(vr => {
+              const link = linksById.get(vr.id);
+              return link ? { ...link, score: vr.score } : null;
+            })
+            .filter((r): r is SearchResult => r !== null)
+            .filter(r => 
+              (searchTags.length === 0 || searchTags.every(t => r.tags.includes(t))) &&
+              (!mime || new RegExp('^' + mime.replace(/\*/g, '.*')).test(r.mime))
+            );
+        }
+      }
+      const paginatedResults = results.slice(offset, offset + limit);
+      log(c, { level: 'info', msg: 'Search successful', status: 200, latencyMs: Date.now() - start });
+      return ok(c, paginatedResults);
+    } catch (e: any) {
+      if (e instanceof z.ZodError) return bad(c, 'Invalid query parameters', e.issues);
+      log(c, { level: 'error', msg: 'Search failed', error: e.message });
+      return serverError(c, 'Search failed');
+    }
   });
   app.get('/api/suggest', async (c) => {
     const start = Date.now();
     const partial = c.req.query('partial')?.toLowerCase() ?? '';
-    log(c, { level: 'info', msg: 'Suggest request received', partial });
+    log(c, { level: 'info', msg: 'Suggest request', partial });
+    const allLinks = await LinkEntity.list(c.env, null, 1000); // Limit for performance
+    const allTags = [...new Set(allLinks.items.flatMap(l => l.tags))];
     const suggestions = partial
-      ? ALL_TAGS.filter(tag => tag.toLowerCase().startsWith(partial))
-      : ALL_TAGS;
+      ? allTags.filter(tag => tag.toLowerCase().startsWith(partial))
+      : allTags;
     log(c, { level: 'info', msg: 'Suggest successful', status: 200, latencyMs: Date.now() - start });
     return ok(c, suggestions.slice(0, 10));
   });
-  app.post('/api/query', zValidator('json', querySchema), async (c) => {
+  app.post('/api/query', async (c) => {
     const start = Date.now();
-    const body = c.req.valid('json');
-    log(c, { level: 'info', msg: 'Agent query received', ...body });
-    // Phase 1: For simplicity, return a fixed set of results for any agent query.
-    const results = MOCK_LINKS.slice(0, 3);
-    log(c, { level: 'info', msg: 'Agent query successful', status: 200, latencyMs: Date.now() - start });
-    return ok(c, results);
+    try {
+      const body = await c.req.json();
+      const { naturalLanguageQuery, filters } = querySchema.parse(body);
+      log(c, { level: 'info', msg: 'Agent query', query: naturalLanguageQuery });
+      // This logic mirrors /api/search, making it a single entry point for agents
+      const queryVector = await embedText(c.env.AI, naturalLanguageQuery);
+      const vectorResults = await searchVectors(c.env.VECTORIZE, queryVector, 20);
+      if (vectorResults.length === 0) {
+        return ok(c, []);
+      }
+      const linkIds = vectorResults.map(r => r.id);
+      const links = (await Promise.all(linkIds.map(id => new LinkEntity(c.env, id).getState())))
+        .filter((link): link is Link => !!link.id);
+      const linksById = new Map(links.map(l => [l.id, l]));
+      const searchTags = filters?.tags || [];
+      const mime = filters?.mime || '';
+      const results = vectorResults
+        .map(vr => {
+          const link = linksById.get(vr.id);
+          return link ? { ...link, score: vr.score } : null;
+        })
+        .filter((r): r is SearchResult => r !== null)
+        .filter(r => 
+          (searchTags.length === 0 || searchTags.every(t => r.tags.includes(t))) &&
+          (!mime || new RegExp('^' + mime.replace(/\*/g, '.*')).test(r.mime))
+        );
+      log(c, { level: 'info', msg: 'Agent query successful', status: 200, latencyMs: Date.now() - start });
+      return ok(c, results);
+    } catch (e: any) {
+      if (e instanceof z.ZodError) return bad(c, 'Invalid request body', e.issues);
+      log(c, { level: 'error', msg: 'Agent query failed', error: e.message });
+      return serverError(c, 'Agent query failed');
+    }
   });
-  app.get('/api/health', (c) => {
+  app.get('/api/health', async (c) => {
     const start = Date.now();
-    log(c, { level: 'info', msg: 'Health check' });
-    const healthData = {
-      version: '1.0.0',
-      vectorizeCount: 1234, // Mock value
-      d1Count: 5678, // Mock value
-      status: 'healthy',
-      timestamp: new Date().toISOString(),
-    };
-    log(c, { level: 'info', msg: 'Health check successful', status: 200, latencyMs: Date.now() - start });
-    return ok(c, healthData);
+    try {
+      const d1Count = (await LinkEntity.list(c.env)).items.length;
+      // Vectorize count is not directly exposed, so we return a placeholder.
+      // A real app might track this separately or use a different metric.
+      const vectorizeCount = -1; // Placeholder
+      const healthData = {
+        version: '1.0.0',
+        vectorizeCount,
+        d1Count,
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+      };
+      log(c, { level: 'info', msg: 'Health check successful', status: 200, latencyMs: Date.now() - start });
+      return ok(c, healthData);
+    } catch (e: any) {
+      log(c, { level: 'error', msg: 'Health check failed', error: e.message });
+      return serverError(c, 'Health check failed');
+    }
   });
 }

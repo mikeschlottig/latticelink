@@ -1,41 +1,55 @@
-/**
- * Minimal real-world demo: One Durable Object instance per entity (User, ChatBoard), with Indexes for listing.
- */
-import { IndexedEntity } from "./core-utils";
-import type { User, Chat, ChatMessage } from "@shared/types";
-import { MOCK_CHAT_MESSAGES, MOCK_CHATS, MOCK_USERS } from "@shared/mock-data";
-
-// USER ENTITY: one DO instance per user
-export class UserEntity extends IndexedEntity<User> {
-  static readonly entityName = "user";
-  static readonly indexName = "users";
-  static readonly initialState: User = { id: "", name: "" };
-  static seedData = MOCK_USERS;
-}
-
-// CHAT BOARD ENTITY: one DO instance per chat board, stores its own messages
-export type ChatBoardState = Chat & { messages: ChatMessage[] };
-
-const SEED_CHAT_BOARDS: ChatBoardState[] = MOCK_CHATS.map(c => ({
-  ...c,
-  messages: MOCK_CHAT_MESSAGES.filter(m => m.chatId === c.id),
-}));
-
-export class ChatBoardEntity extends IndexedEntity<ChatBoardState> {
-  static readonly entityName = "chat";
-  static readonly indexName = "chats";
-  static readonly initialState: ChatBoardState = { id: "", title: "", messages: [] };
-  static seedData = SEED_CHAT_BOARDS;
-
-  async listMessages(): Promise<ChatMessage[]> {
-    const { messages } = await this.getState();
-    return messages;
+import { IndexedEntity, type Env } from "./core-utils";
+import type { Link } from "@shared/types";
+export type LinkState = Link;
+export class LinkEntity extends IndexedEntity<LinkState> {
+  static readonly entityName = "link";
+  static readonly indexName = "links";
+  static readonly initialState: LinkState = {
+    id: "",
+    url: "",
+    title: "",
+    description: "",
+    h1: "",
+    mime: "",
+    byteSize: 0,
+    lastModified: null,
+    ingestedAt: "",
+    tags: [],
+  };
+  /**
+   * Creates a new link if it doesn't exist, or returns the existing one.
+   * Idempotency is based on the URL.
+   */
+  static async createOrGet(env: Env, state: Omit<LinkState, 'id' | 'ingestedAt'>): Promise<{ link: LinkState, existed: boolean }> {
+    // We use a separate index for URL -> ID mapping to check for existence
+    // This is more efficient than listing all entities.
+    const urlIndex = new IndexedEntity< { id: string } >(env, `link-url:${state.url}`);
+    await urlIndex.getState(); // ensure state is loaded
+    const existingId = urlIndex.state.id;
+    if (existingId) {
+      const existingLink = new LinkEntity(env, existingId);
+      return { link: await existingLink.getState(), existed: true };
+    }
+    const id = crypto.randomUUID();
+    const newState: LinkState = {
+      ...state,
+      id,
+      ingestedAt: new Date().toISOString(),
+    };
+    const inst = new this(env, id);
+    await inst.save(newState);
+    // Add to main ID index
+    const idx = new this(env, this.indexName)._getIndex();
+    await idx.add(id);
+    // Add to URL -> ID index
+    await urlIndex.save({ id });
+    const urlIdx = new this(env, `index:link-urls`)._getIndex();
+    await urlIdx.add(state.url);
+    return { link: newState, existed: false };
   }
-
-  async sendMessage(userId: string, text: string): Promise<ChatMessage> {
-    const msg: ChatMessage = { id: crypto.randomUUID(), chatId: this.id, userId, text, ts: Date.now() };
-    await this.mutate(s => ({ ...s, messages: [...s.messages, msg] }));
-    return msg;
+  // Helper to get the underlying index instance
+  _getIndex() {
+    const Ctor = this.constructor as typeof LinkEntity;
+    return new (this._getIndexClass())(this.env, Ctor.indexName);
   }
 }
-
