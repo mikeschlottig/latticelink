@@ -11,7 +11,7 @@ import type { IngestRequest, Link, SearchResult } from "@shared/types";
 const ingestSchema = z.object({
   url: z.string().url(),
   tags: z.array(z.string()).optional().default([]),
-  metadata: z.record(z.unknown()).optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
 });
 const searchSchema = z.object({
   q: z.string().optional().default(''),
@@ -93,7 +93,15 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
       log(c, { level: 'info', msg: 'Search request' });
       let results: SearchResult[] = [];
       const searchTags = tags ? tags.split(',').filter(Boolean) : [];
-      if (q.startsWith('"') && q.endsWith('"')) {
+      if (q === '') {
+        const allLinks = await LinkEntity.list(c.env);
+        results = allLinks.items
+          .filter(link =>
+            (searchTags.length === 0 || searchTags.every(t => link.tags.includes(t))) &&
+            (!mime || new RegExp('^' + mime.replace(/\*/g, '.*')).test(link.mime))
+          )
+          .map(link => ({ ...link, score: null }));
+      } else if (q.startsWith('"') && q.endsWith('"')) {
         const term = q.substring(1, q.length - 1).toLowerCase();
         const allLinks = await LinkEntity.list(c.env);
         results = allLinks.items
@@ -115,12 +123,13 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
           const links = (await Promise.all(linkIds.map(id => new LinkEntity(c.env, id).getState())))
             .filter((link): link is Link => !!link?.id);
           const linksById = new Map(links.map(l => [l.id, l]));
-          results = vectorResults
+          const mapped = vectorResults
             .map(vr => {
               const link = linksById.get(vr.id);
               return link ? { ...link, score: vr.score } : null;
-            })
-            .filter((r): r is SearchResult => r !== null && typeof r.score === 'number')
+            });
+          const filtered = mapped.filter(r => r !== null && typeof (r as any).score === 'number') as SearchResult[];
+          results = filtered
             .filter(r =>
               (searchTags.length === 0 || searchTags.every(t => r.tags.includes(t))) &&
               (!mime || new RegExp('^' + mime.replace(/\*/g, '.*')).test(r.mime))
@@ -166,12 +175,13 @@ export function userRoutes(app: Hono<{ Bindings: Env }>) {
       const linksById = new Map(links.map(l => [l.id, l]));
       const searchTags = filters?.tags || [];
       const mime = filters?.mime || '';
-      const results = vectorResults
+      const mapped = vectorResults
         .map(vr => {
           const link = linksById.get(vr.id);
           return link ? { ...link, score: vr.score } : null;
-        })
-        .filter((r): r is SearchResult => r !== null && typeof r.score === 'number')
+        });
+      const filtered = mapped.filter(r => r !== null && typeof (r as any).score === 'number') as SearchResult[];
+      const results = filtered
         .filter(r =>
           (searchTags.length === 0 || searchTags.every(t => r.tags.includes(t))) &&
           (!mime || new RegExp('^' + mime.replace(/\*/g, '.*')).test(r.mime))

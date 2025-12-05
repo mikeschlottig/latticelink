@@ -10,8 +10,9 @@ export async function embedText(ai: Env['AI'], text: string): Promise<number[]> 
   try {
     const response = await ai.run('@cf/baai/bge-small-en-v1.5', { text: [text] });
     // Workers AI returns { data: [ [vector1], [vector2] ] }
-    if (Array.isArray(response.data) && response.data.length > 0 && Array.isArray(response.data[0])) {
-      return response.data[0];
+    const responseAny = response as any;
+    if (Array.isArray(responseAny.data) && responseAny.data.length > 0 && Array.isArray(responseAny.data[0])) {
+      return responseAny.data[0];
     }
     return [];
   } catch (error) {
@@ -25,17 +26,20 @@ export async function embedText(ai: Env['AI'], text: string): Promise<number[]> 
 export async function upsertVector(vectorize: Env['VECTORIZE'], link: Link, vector: number[]): Promise<void> {
   if (!vectorize) throw new Error('VECTORIZE binding missing: cannot upsert vector');
   try {
+    const metadata: any = {
+      url: link.url,
+      title: link.title,
+      description: link.description,
+      mime: link.mime,
+      byteSize: link.byteSize,
+    };
+    if (link.lastModified != null) {
+      metadata.lastModified = link.lastModified;
+    }
     await vectorize.upsert([{
       id: String(link.id),
       values: vector,
-      metadata: {
-        url: link.url,
-        title: link.title,
-        description: link.description,
-        mime: link.mime,
-        byteSize: link.byteSize,
-        lastModified: link.lastModified,
-      },
+      metadata,
     }]);
   } catch (error) {
     console.error(`Failed to upsert vector for link ID ${link.id}:`, error);
