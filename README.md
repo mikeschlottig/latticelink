@@ -1,5 +1,5 @@
 # LatticeLink
-[cloudflarebutton]
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/mikeschlottig/latticelink)
 ## Overview
 LatticeLink is a Cloudflare-native link ingestion, vectorization, and search application. It enables users to submit URLs for processing, where metadata is extracted, content is embedded using Workers AI, and data is stored in D1 and Vectorize for efficient semantic and full-text search. The application features a polished single-page UI for interactive searching and filtering, along with RESTful APIs designed for both direct use and AI agent integration.
 Built entirely on Cloudflare's edge platform, LatticeLink leverages Workers for routing and logic, D1 for relational storage, Vectorize for vector search, and Workers AI for embeddings. It's deployable as a single Workers project with no external dependencies beyond Cloudflare services.
@@ -114,4 +114,4 @@ The project uses D1 for relational storage (links/tags tables), with a fallback 
 - **D1 Binding Missing**: Configure `wrangler.toml` and run `wrangler deploy`. For local development, ensure your local wrangler is up to date.
 - **Ingestion Idempotency**: D1's `UNIQUE` constraint on the `url` column handles duplicates gracefully.
 - **Local Dev Issues**: `wrangler dev` runs the worker locally. Ensure you have authenticated with `wrangler login`. For D1, local development uses a local SQLite file.
-[cloudflarebutton]
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/mikeschlottig/latticelink)
